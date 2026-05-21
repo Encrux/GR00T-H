@@ -262,7 +262,13 @@ class Gr00tN1d6ActionHead(nn.Module):
                 self.t_grid.to(actions.device, dtype=torch.float32)
                 .expand(B, -1)
             )                                                        # [B, T] f32
-            with torch.no_grad():
+            # Disable autocast — trainer wraps the whole forward in bf16
+            # autocast, which intercepts matmuls/einsums inside the BSpline
+            # solve and casts them down to bf16 even though our inputs are
+            # float32. torch.linalg.solve doesn't support bf16.
+            with torch.no_grad(), torch.amp.autocast(
+                device_type=actions.device.type, enabled=False
+            ):
                 params_dict = self.bspline.learn_mp_params_from_trajs(
                     times_b, actions.to(torch.float32)
                 )
@@ -465,7 +471,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                 .expand(B, -1)
             )                                                             # [B, T] f32
             cp_flat = actions.reshape(B, -1).to(torch.float32)            # [B, K*D] f32
-            traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat)
+            with torch.amp.autocast(device_type=actions.device.type, enabled=False):
+                traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat)
             actions = traj.to(dtype=vl_embeds.dtype)                      # [B, T, D]
         return BatchFeature(
             data={
