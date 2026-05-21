@@ -250,12 +250,18 @@ class Gr00tN1d6ActionHead(nn.Module):
         if self.use_bspline:
             # Encode GT trajectory → K control points. No gradient needed for
             # the target side; this is a fixed-per-batch supervised target.
-            # torch.linalg.solve (used inside BSpline) doesn't support bf16, so
-            # cast actions to float32 for the encode then back for downstream
-            # flow-matching ops.
+            # torch.linalg.solve (used inside BSpline) doesn't support bf16,
+            # but model.to(bf16) auto-casts buffers + child-module params.
+            # So force float32 on: the BSpline's internal state, the t_grid,
+            # and the trajectory we encode. Cast result back to bf16 for the
+            # downstream flow-matching loop.
             orig_dtype = actions.dtype
             B = actions.shape[0]
-            times_b = self.t_grid.to(actions.device).expand(B, -1)   # [B, T]
+            self.bspline.float()                                     # idempotent
+            times_b = (
+                self.t_grid.to(actions.device, dtype=torch.float32)
+                .expand(B, -1)
+            )                                                        # [B, T] f32
             with torch.no_grad():
                 params_dict = self.bspline.learn_mp_params_from_trajs(
                     times_b, actions.to(torch.float32)
@@ -449,10 +455,16 @@ class Gr00tN1d6ActionHead(nn.Module):
             actions = actions + dt * pred_velocity
 
         # If BEAST, decode predicted control points to a T-step trajectory.
+        # Same dtype dance as in forward() — keep BSpline state + inputs in
+        # float32, cast result back to bf16 for downstream tensors.
         if self.use_bspline:
             B = actions.shape[0]
-            times_b = self.t_grid.to(actions.device).expand(B, -1)        # [B, T]
-            cp_flat = actions.reshape(B, -1).to(self.t_grid.dtype)        # [B, K*D]
+            self.bspline.float()
+            times_b = (
+                self.t_grid.to(actions.device, dtype=torch.float32)
+                .expand(B, -1)
+            )                                                             # [B, T] f32
+            cp_flat = actions.reshape(B, -1).to(torch.float32)            # [B, K*D] f32
             traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat)
             actions = traj.to(dtype=vl_embeds.dtype)                      # [B, T, D]
         return BatchFeature(
