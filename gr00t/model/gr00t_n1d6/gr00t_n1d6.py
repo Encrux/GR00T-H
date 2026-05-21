@@ -98,6 +98,27 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
+
+        # BEAST: load the B-spline tokenizer's BSpline class (we don't keep the
+        # outer processor — its __init__ hardcodes device='cuda' and we want a
+        # CPU-friendly construction with our own K / num_dof / degree).
+        self.use_bspline = getattr(config, "use_bspline", False)
+        if self.use_bspline:
+            from transformers import AutoProcessor
+            beast_proc = AutoProcessor.from_pretrained(
+                config.beast_processor_id, trust_remote_code=True
+            )
+            BSplineClass = type(beast_proc.bsp)
+            self.bspline = BSplineClass(
+                num_basis=config.bspline_num_basis,
+                num_dof=config.max_action_dim,
+                degree=config.bspline_degree,
+            )
+            self.register_buffer(
+                "t_grid",
+                torch.linspace(0, 1, config.action_horizon, dtype=torch.float32),
+            )
+
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -225,7 +246,19 @@ class Gr00tN1d6ActionHead(nn.Module):
             state_features = state_features + noise
 
         # Embed noised action trajectory.
-        actions = action_input.action
+        actions = action_input.action                                # [B, T, D]
+        if self.use_bspline:
+            # Encode GT trajectory → K control points. No gradient needed for
+            # the target side; this is a fixed-per-batch supervised target.
+            B = actions.shape[0]
+            times_b = self.t_grid.to(actions.device).expand(B, -1)   # [B, T]
+            with torch.no_grad():
+                params_dict = self.bspline.learn_mp_params_from_trajs(
+                    times_b, actions
+                )
+                actions = params_dict["params"].view(
+                    B, self.config.bspline_num_basis, -1
+                )                                                    # [B, K, D]
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -272,7 +305,15 @@ class Gr00tN1d6ActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
+        if self.use_bspline:
+            # Original mask is [B, T, D] but our target lives in control-point
+            # space [B, K, D]. Supervise every control point uniformly — the
+            # padded action dims (above the embodiment's true action dim) stay
+            # at zero in the GT trajectory, so they also reconstruct to ~zero
+            # control points and contribute negligibly to the loss.
+            action_mask = torch.ones_like(pred_actions)
+        else:
+            action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
@@ -342,10 +383,18 @@ class Gr00tN1d6ActionHead(nn.Module):
         vl_embeds = backbone_features
 
         # Set initial actions as the sampled noise.
+        # When use_bspline, the DiT operates on K control-point tokens (one per
+        # spline basis) instead of T raw timesteps; we decode to a T-step
+        # trajectory after Euler integration.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
+        horizon = (
+            self.config.bspline_num_basis
+            if self.use_bspline
+            else self.config.action_horizon
+        )
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
+            size=(batch_size, horizon, self.action_dim),
             dtype=vl_embeds.dtype,
             device=device,
         )
@@ -388,10 +437,18 @@ class Gr00tN1d6ActionHead(nn.Module):
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
-            pred_velocity = pred[:, -self.action_horizon :]
+            pred_velocity = pred[:, -horizon:]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+
+        # If BEAST, decode predicted control points to a T-step trajectory.
+        if self.use_bspline:
+            B = actions.shape[0]
+            times_b = self.t_grid.to(actions.device).expand(B, -1)        # [B, T]
+            cp_flat = actions.reshape(B, -1).to(self.t_grid.dtype)        # [B, K*D]
+            traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat)
+            actions = traj.to(dtype=vl_embeds.dtype)                      # [B, T, D]
         return BatchFeature(
             data={
                 "action_pred": actions,

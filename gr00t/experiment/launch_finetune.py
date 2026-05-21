@@ -188,6 +188,9 @@ if __name__ == "__main__":
         config.model.state_dropout_prob_per_embodiment = (
             ft_config.state_dropout_prob_per_embodiment
         )
+    config.model.use_bspline = ft_config.use_bspline
+    config.model.bspline_num_basis = ft_config.bspline_num_basis
+    config.model.bspline_degree = ft_config.bspline_degree
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     if ft_config.extra_augmentation_config:

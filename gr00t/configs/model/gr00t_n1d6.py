@@ -104,6 +104,15 @@ class Gr00tN1d6Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # BEAST (B-spline action tokenizer) parameters. When use_bspline=True, the
+    # action head predicts K control points per channel instead of T raw action
+    # steps; control points are decoded to a T-step trajectory via a fixed
+    # B-spline basis at inference. See beast-groot-h-integration plan.
+    use_bspline: bool = False
+    bspline_num_basis: int = 10        # K (control points)
+    bspline_degree: int = 4            # C³-continuous → bounded jerk
+    beast_processor_id: str = "zhouhongyi/beast"
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

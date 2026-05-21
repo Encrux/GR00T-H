@@ -74,6 +74,18 @@ class FinetuneConfig:
     state_dropout_prob_per_embodiment when set.
     """
 
+    # --- BEAST (B-spline action tokenizer) ---
+    use_bspline: bool = False
+    """If True, predict K B-spline control points per action channel instead of
+    T raw timesteps; control points are decoded to a T-step trajectory via a
+    fixed B-spline basis. See beast-groot-h-integration plan."""
+
+    bspline_num_basis: int = 10
+    """Number of B-spline control points (K). DiT predicts a length-K sequence."""
+
+    bspline_degree: int = 4
+    """B-spline polynomial degree. Degree 4 → C³-continuous → bounded jerk."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
