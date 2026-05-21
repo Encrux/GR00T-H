@@ -250,14 +250,20 @@ class Gr00tN1d6ActionHead(nn.Module):
         if self.use_bspline:
             # Encode GT trajectory → K control points. No gradient needed for
             # the target side; this is a fixed-per-batch supervised target.
+            # torch.linalg.solve (used inside BSpline) doesn't support bf16, so
+            # cast actions to float32 for the encode then back for downstream
+            # flow-matching ops.
+            orig_dtype = actions.dtype
             B = actions.shape[0]
             times_b = self.t_grid.to(actions.device).expand(B, -1)   # [B, T]
             with torch.no_grad():
                 params_dict = self.bspline.learn_mp_params_from_trajs(
-                    times_b, actions
+                    times_b, actions.to(torch.float32)
                 )
-                actions = params_dict["params"].view(
-                    B, self.config.bspline_num_basis, -1
+                actions = (
+                    params_dict["params"]
+                    .view(B, self.config.bspline_num_basis, -1)
+                    .to(orig_dtype)
                 )                                                    # [B, K, D]
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
