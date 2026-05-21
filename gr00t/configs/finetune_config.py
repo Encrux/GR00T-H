@@ -56,6 +56,12 @@ class FinetuneConfig:
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
+    action_horizon: int = 50
+    """Number of action timesteps the model predicts per forward pass. Must match
+    the data pipeline's window length (set via the modality config's
+    delta_indices). Default 50 matches peg-transfer; sofa_env / Scheikl tasks
+    use 16."""
+
     state_dropout_prob: float = 0.0
     """
     Dropout probability applied to state inputs for regularization during training.

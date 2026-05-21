@@ -188,6 +188,7 @@ if __name__ == "__main__":
         config.model.state_dropout_prob_per_embodiment = (
             ft_config.state_dropout_prob_per_embodiment
         )
+    config.model.action_horizon = ft_config.action_horizon
     config.model.use_bspline = ft_config.use_bspline
     config.model.bspline_num_basis = ft_config.bspline_num_basis
     config.model.bspline_degree = ft_config.bspline_degree
