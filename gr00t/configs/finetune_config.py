@@ -67,6 +67,13 @@ class FinetuneConfig:
     values are dropout probabilities in [0.0, 1.0].
     """
 
+    state_dropout_prob_per_embodiment_json: str | None = None
+    """
+    JSON string form of state_dropout_prob_per_embodiment, for shell-friendly
+    invocation. Example: '{"jhu_imerse_dvrk_mono": 1.0}'. Takes precedence over
+    state_dropout_prob_per_embodiment when set.
+    """
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
@@ -169,6 +176,15 @@ class FinetuneConfig:
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+
+    # --- Statistics Override ---
+    override_pretraining_statistics: bool = False
+    """
+    If True, override the pretrained model's normalization statistics with
+    statistics computed from the fine-tuning dataset. Required when the
+    fine-tuning data has a different distribution than the pretraining data
+    (e.g., different coordinate frame, workspace size, or gripper units).
+    """
 
     # --- Statistics Calculation Flags ---
     calculate_norm_stats: bool = False

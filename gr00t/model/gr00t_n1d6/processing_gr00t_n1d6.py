@@ -53,6 +53,7 @@ EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
     "ustc_torin_tuodao": 12,
     "ucsd_dvrk": 14,
     "jhu_imerse_dvrk_mono": 15,
+    "jhu_imerse_dvrk_mono_stereo": 15,  # share the mono per-embodiment slot — same state/action layout, just adds a second video stream
     "rob_surgical_bitrack": 16,
     "stanford_dvrk_real": 17,
     "obuda_dvrk": 18,

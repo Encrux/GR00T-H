@@ -68,6 +68,13 @@ class EmbodimentTag(Enum):
     representation as the standard dVRK embodiment.
     """
 
+    JHU_IMERSE_DVRK_MONO_STEREO = "jhu_imerse_dvrk_mono_stereo"
+    """
+    Stereo JHU dVRK surgical robot variant (parallel-axis stereo endoscope).
+    Uses both endoscope_left and endoscope_right video streams with the same
+    dual-arm state/action representation as the monocular variant.
+    """
+
     JHU_LSCR_DVRK_MIRACLE = "jhu_lscr_dvrk_miracle"
     """
     JHU LSCR MIRACLE datasets.

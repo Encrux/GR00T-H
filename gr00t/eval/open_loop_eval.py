@@ -195,21 +195,74 @@ def evaluate_single_trajectory(
             np_dict[column] = np.vstack([arr for arr in traj[column]])
         return np.concatenate([np_dict[column] for column in columns], axis=-1)
 
+    def extract_with_slices(traj: pd.DataFrame, columns: list[str]):
+        """Like extract_state_joints, but also returns {column: (start, end)} slices."""
+        np_dict = {}
+        for column in columns:
+            np_dict[column] = np.vstack([arr for arr in traj[column]])
+        slices = {}
+        offset = 0
+        for column in columns:
+            d = np_dict[column].shape[1]
+            slices[column] = (offset, offset + d)
+            offset += d
+        return np.concatenate([np_dict[column] for column in columns], axis=-1), slices
+
     # plot the joints
     state_joints_across_time = extract_state_joints(traj, [f"state.{key}" for key in state_keys])
-    gt_action_across_time = extract_state_joints(traj, [f"action.{key}" for key in action_keys])[
-        :actual_steps
-    ]
+    gt_action_across_time, action_slices = extract_with_slices(
+        traj, [f"action.{key}" for key in action_keys]
+    )
+    gt_action_across_time = gt_action_across_time[:actual_steps]
     pred_action_across_time = np.array(pred_action_across_time)[:actual_steps]
     assert gt_action_across_time.shape == pred_action_across_time.shape, (
         f"gt_action: {gt_action_across_time.shape}, pred_action: {pred_action_across_time.shape}"
     )
 
-    # calc MSE and MAE across time
-    mse = np.mean((gt_action_across_time - pred_action_across_time) ** 2)
-    mae = np.mean(np.abs(gt_action_across_time - pred_action_across_time))
+    # ── Overall MSE/MAE (averaged over all action dims, including any zero-padded) ──
+    err = gt_action_across_time - pred_action_across_time
+    mse = float(np.mean(err ** 2))
+    mae = float(np.mean(np.abs(err)))
     logging.info(f"Unnormalized Action MSE across single traj: {mse}")
     logging.info(f"Unnormalized Action MAE across single traj: {mae}")
+
+    # ── Per-key MSE/MAE ──
+    # Useful when arms or modalities have different scales (xyz in m, quat ~unit, jaw radians).
+    # Also flags zero-padded dims (e.g. PSM2 in monomanual setup) that trivially have 0 error.
+    per_key_metrics: dict[str, dict[str, float]] = {}
+    for col, (s, e) in action_slices.items():
+        key = col[len("action."):] if col.startswith("action.") else col
+        gt_slice = gt_action_across_time[:, s:e]
+        pr_slice = pred_action_across_time[:, s:e]
+        per_key_metrics[key] = {
+            "mse": float(np.mean((gt_slice - pr_slice) ** 2)),
+            "mae": float(np.mean(np.abs(gt_slice - pr_slice))),
+            "gt_range": float(np.ptp(gt_slice)),
+            "is_constant_zero": bool(np.allclose(gt_slice, 0.0)),
+        }
+        logging.info(
+            f"  {key:20s}  MSE={per_key_metrics[key]['mse']:.6f}  "
+            f"MAE={per_key_metrics[key]['mae']:.6f}  "
+            f"gt_range={per_key_metrics[key]['gt_range']:.4f}"
+            f"{'  (zero-padded)' if per_key_metrics[key]['is_constant_zero'] else ''}"
+        )
+
+    # ── Active-dim aggregate: drop trivially-zero columns (e.g. unused PSM2 in mono setup) ──
+    mse_active = mae_active = None
+    active_cols = [
+        slice(s, e) for col, (s, e) in action_slices.items()
+        if not per_key_metrics[col[len("action."):]]["is_constant_zero"]
+    ]
+    if active_cols and len(active_cols) < len(action_slices):
+        active_idx = np.concatenate([np.arange(sl.start, sl.stop) for sl in active_cols])
+        gt_active = gt_action_across_time[:, active_idx]
+        pr_active = pred_action_across_time[:, active_idx]
+        mse_active = float(np.mean((gt_active - pr_active) ** 2))
+        mae_active = float(np.mean(np.abs(gt_active - pr_active)))
+        logging.info(
+            f"  Active-dim aggregate (excludes zero-padded): MSE={mse_active:.6f}  "
+            f"MAE={mae_active:.6f}"
+        )
 
     logging.info(f"state_joints vs time {state_joints_across_time.shape}")
     logging.info(f"gt_action_joints vs time {gt_action_across_time.shape}")
@@ -227,7 +280,19 @@ def evaluate_single_trajectory(
         save_plot_path=save_plot_path or f"/tmp/open_loop_eval/traj_{traj_id}.jpeg",
     )
 
-    return mse, mae
+    # Build a per-trajectory result dict for downstream aggregation/plotting.
+    task_index = int(traj["task_index"].iloc[0]) if "task_index" in traj.columns else None
+    result = {
+        "traj_id": int(traj_id),
+        "task_index": task_index,
+        "n_steps": int(actual_steps),
+        "mse": float(mse),
+        "mae": float(mae),
+        "mse_active_dim": mse_active,
+        "mae_active_dim": mae_active,
+        "per_key": per_key_metrics,
+    }
+    return result
 
 
 @dataclass
@@ -266,6 +331,9 @@ class ArgsConfig:
 
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
+
+    results_json: str | None = None
+    """Path to dump per-trajectory results (JSON) for downstream plotting."""
 
 
 def main(args: ArgsConfig):
@@ -315,18 +383,32 @@ def main(args: ArgsConfig):
     )
 
     logging.info(f"Dataset length: {len(dataset)}")
-    logging.info(f"Running evaluation on trajectories: {args.traj_ids}")
 
-    all_mse = []
-    all_mae = []
+    # Resolve task_index -> task description for the results JSON, if available.
+    tasks_jsonl = Path(args.dataset_path) / "meta" / "tasks.jsonl"
+    task_index_to_desc: dict[int, str] = {}
+    if tasks_jsonl.exists():
+        import json as _json
+        with open(tasks_jsonl) as f:
+            for line in f:
+                row = _json.loads(line)
+                task_index_to_desc[int(row["task_index"])] = row["task"]
 
-    for traj_id in args.traj_ids:
+    # If traj_ids is empty or contains a sentinel "-1", evaluate all trajectories.
+    traj_ids = list(args.traj_ids)
+    if not traj_ids or traj_ids == [-1]:
+        traj_ids = list(range(len(dataset)))
+    logging.info(f"Running evaluation on trajectories: {traj_ids}")
+
+    per_traj_results = []
+
+    for traj_id in traj_ids:
         if traj_id >= len(dataset):
             logging.warning(f"Trajectory ID {traj_id} is out of range. Skipping.")
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
-        mse, mae = evaluate_single_trajectory(
+        result = evaluate_single_trajectory(
             policy,
             dataset,
             traj_id,
@@ -336,17 +418,37 @@ def main(args: ArgsConfig):
             action_horizon=args.action_horizon,
             save_plot_path=args.save_plot_path,
         )
-        logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
-        all_mse.append(mse)
-        all_mae.append(mae)
+        result["task_description"] = task_index_to_desc.get(result["task_index"])
+        logging.info(f"MSE for trajectory {traj_id}: {result['mse']}, MAE: {result['mae']}")
+        per_traj_results.append(result)
 
-    if all_mse:
-        avg_mse = np.mean(np.array(all_mse))
-        avg_mae = np.mean(np.array(all_mae))
+    if per_traj_results:
+        avg_mse = float(np.mean([r["mse"] for r in per_traj_results]))
+        avg_mae = float(np.mean([r["mae"] for r in per_traj_results]))
         logging.info(f"Average MSE across all trajs: {avg_mse}")
         logging.info(f"Average MAE across all trajs: {avg_mae}")
     else:
+        avg_mse = avg_mae = None
         logging.info("No valid trajectories were evaluated.")
+
+    if args.results_json:
+        import json as _json
+        out = {
+            "model_path": args.model_path,
+            "global_step": global_step,
+            "dataset_path": args.dataset_path,
+            "embodiment_tag": args.embodiment_tag.value,
+            "steps": args.steps,
+            "action_horizon": args.action_horizon,
+            "avg_mse": avg_mse,
+            "avg_mae": avg_mae,
+            "per_traj": per_traj_results,
+        }
+        Path(args.results_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.results_json, "w") as f:
+            _json.dump(out, f, indent=2)
+        logging.info(f"Wrote results JSON to {args.results_json}")
+
     logging.info("Done")
 
 

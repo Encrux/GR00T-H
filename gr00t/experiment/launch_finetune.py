@@ -180,7 +180,14 @@ if __name__ == "__main__":
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob
-    config.model.state_dropout_prob_per_embodiment = ft_config.state_dropout_prob_per_embodiment
+    if ft_config.state_dropout_prob_per_embodiment_json:
+        config.model.state_dropout_prob_per_embodiment = json.loads(
+            ft_config.state_dropout_prob_per_embodiment_json
+        )
+    else:
+        config.model.state_dropout_prob_per_embodiment = (
+            ft_config.state_dropout_prob_per_embodiment
+        )
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     if ft_config.extra_augmentation_config:
@@ -224,5 +231,6 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    config.data.override_pretraining_statistics = ft_config.override_pretraining_statistics
 
     run(config)
