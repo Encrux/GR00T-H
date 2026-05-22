@@ -238,13 +238,22 @@ def evaluate_single_trajectory(
             "mse": float(np.mean((gt_slice - pr_slice) ** 2)),
             "mae": float(np.mean(np.abs(gt_slice - pr_slice))),
             "gt_range": float(np.ptp(gt_slice)),
+            "gt_min": float(np.min(gt_slice)),
+            "gt_max": float(np.max(gt_slice)),
+            "gt_mean": float(np.mean(gt_slice)),
+            "gt_std": float(np.std(gt_slice)),
+            "pred_min": float(np.min(pr_slice)),
+            "pred_max": float(np.max(pr_slice)),
+            "pred_mean": float(np.mean(pr_slice)),
+            "pred_std": float(np.std(pr_slice)),
             "is_constant_zero": bool(np.allclose(gt_slice, 0.0)),
         }
+        m = per_key_metrics[key]
         logging.info(
-            f"  {key:20s}  MSE={per_key_metrics[key]['mse']:.6f}  "
-            f"MAE={per_key_metrics[key]['mae']:.6f}  "
-            f"gt_range={per_key_metrics[key]['gt_range']:.4f}"
-            f"{'  (zero-padded)' if per_key_metrics[key]['is_constant_zero'] else ''}"
+            f"  {key:20s}  MAE={m['mae']:.4f}  "
+            f"gt[min={m['gt_min']:+.3f} max={m['gt_max']:+.3f} mean={m['gt_mean']:+.3f} std={m['gt_std']:.3f}]  "
+            f"pred[min={m['pred_min']:+.3f} max={m['pred_max']:+.3f} mean={m['pred_mean']:+.3f} std={m['pred_std']:.3f}]"
+            f"{'  (gt-zero-padded)' if m['is_constant_zero'] else ''}"
         )
 
     # ── Active-dim aggregate: drop trivially-zero columns (e.g. unused PSM2 in mono setup) ──
@@ -335,10 +344,25 @@ class ArgsConfig:
     results_json: str | None = None
     """Path to dump per-trajectory results (JSON) for downstream plotting."""
 
+    modality_config_path: str | None = None
+    """Path to a Python file defining the modality config for the embodiment.
+    Required for NEW_EMBODIMENT — mirrors launch_finetune.py's load_modality_config."""
+
 
 def main(args: ArgsConfig):
     # Set up logging
     logging.basicConfig(level=logging.INFO)
+
+    # Register NEW_EMBODIMENT modality config (side-effect import) before policy load.
+    if args.modality_config_path:
+        import importlib, sys as _sys
+        from pathlib import Path as _Path
+        p = _Path(args.modality_config_path)
+        if not (p.exists() and p.suffix == ".py"):
+            raise FileNotFoundError(f"Modality config not found: {p}")
+        _sys.path.insert(0, str(p.parent))
+        importlib.import_module(p.stem)
+        logging.info(f"Loaded modality config: {p}")
 
     # Download model checkpoint if it's an S3 path
     local_model_path = args.model_path
