@@ -272,9 +272,18 @@ class Gr00tN1d6ActionHead(nn.Module):
                 params_dict = self.bspline.learn_mp_params_from_trajs(
                     times_b, actions.to(torch.float32)
                 )
+                # BSpline returns params flat in (D, K)-major order — each
+                # contiguous block of K values is one DOF's basis. View as
+                # (B, D, K) then transpose to put K on the temporal axis the
+                # DiT expects. .view(B, K, D) directly would scramble DOFs
+                # across tokens and break per-token action_decoder weights +
+                # position embeddings.
+                K = self.config.bspline_num_basis
                 actions = (
                     params_dict["params"]
-                    .view(B, self.config.bspline_num_basis, -1)
+                    .view(B, -1, K)
+                    .transpose(-1, -2)
+                    .contiguous()
                     .to(orig_dtype)
                 )                                                    # [B, K, D]
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
@@ -470,7 +479,11 @@ class Gr00tN1d6ActionHead(nn.Module):
                 self.t_grid.to(actions.device, dtype=torch.float32)
                 .expand(B, -1)
             )                                                             # [B, T] f32
-            cp_flat = actions.reshape(B, -1).to(torch.float32)            # [B, K*D] f32
+            # Mirror the forward()-side layout: model emits (B, K, D); BSpline
+            # decoder expects flat in (D, K)-major. Transpose before flatten.
+            cp_flat = (
+                actions.transpose(-1, -2).contiguous().reshape(B, -1).to(torch.float32)
+            )                                                              # [B, D*K] f32
             with torch.amp.autocast(device_type=actions.device.type, enabled=False):
                 traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat)
             actions = traj.to(dtype=vl_embeds.dtype)                      # [B, T, D]
