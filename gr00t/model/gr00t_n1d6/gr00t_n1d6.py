@@ -118,6 +118,21 @@ class Gr00tN1d6ActionHead(nn.Module):
                 "t_grid",
                 torch.linspace(0, 1, config.action_horizon, dtype=torch.float32),
             )
+            # Per-channel std for normalizing control points to ~unit variance
+            # before flow matching. Pretrained DiT + action_decoder + the unit-
+            # variance noise schedule all assume O(1) targets; unnormalized CPs
+            # are ~5-10× larger per channel, which breaks SNR per timestep.
+            # Estimated as a running mean over the first `cp_std_warmup_steps`
+            # training batches, then frozen (saved in state_dict).
+            self.cp_std_warmup_steps = 50
+            self.register_buffer(
+                "cp_std",
+                torch.ones(config.max_action_dim, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "cp_std_init_steps",
+                torch.zeros(1, dtype=torch.long),
+            )
 
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
@@ -279,13 +294,32 @@ class Gr00tN1d6ActionHead(nn.Module):
                 # across tokens and break per-token action_decoder weights +
                 # position embeddings.
                 K = self.config.bspline_num_basis
-                actions = (
+                actions_f32 = (
                     params_dict["params"]
                     .view(B, -1, K)
                     .transpose(-1, -2)
                     .contiguous()
-                    .to(orig_dtype)
-                )                                                    # [B, K, D]
+                )                                                    # [B, K, D] fp32
+
+                # Update / freeze per-channel CP std (running mean over the
+                # first cp_std_warmup_steps batches).
+                if self.training:
+                    n_done = int(self.cp_std_init_steps.item())
+                    if n_done < self.cp_std_warmup_steps:
+                        batch_std = (
+                            actions_f32.std(dim=(0, 1)).clamp(min=1e-2)
+                        )                                            # [D]
+                        if n_done == 0:
+                            self.cp_std.copy_(batch_std)
+                        else:
+                            self.cp_std.mul_(n_done / (n_done + 1)).add_(
+                                batch_std / (n_done + 1)
+                            )
+                        self.cp_std_init_steps.add_(1)
+
+                # Normalize CPs to ~unit variance per channel before flow loss.
+                cp_std_view = self.cp_std.view(1, 1, -1)             # [1, 1, D]
+                actions = (actions_f32 / cp_std_view).to(orig_dtype)
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -481,6 +515,12 @@ class Gr00tN1d6ActionHead(nn.Module):
                 self.t_grid.to(actions.device, dtype=torch.float32)
                 .expand(B, -1)
             )                                                             # [B, T] f32
+            # Denormalize predicted CPs back to original (encoded) scale before
+            # BSpline decode — mirrors the per-channel division in forward().
+            cp_std_view = self.cp_std.view(1, 1, -1).to(
+                device=actions.device, dtype=actions.dtype
+            )                                                             # [1, 1, D]
+            actions = actions * cp_std_view
             # Mirror the forward()-side layout: model emits (B, K, D); BSpline
             # decoder expects flat in (D, K)-major. Transpose before flatten.
             cp_flat = (
