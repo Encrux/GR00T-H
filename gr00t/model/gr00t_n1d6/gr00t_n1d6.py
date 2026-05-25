@@ -365,19 +365,40 @@ class Gr00tN1d6ActionHead(nn.Module):
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
 
-        # Slice out only the action portion of pred and target.
+        # Loss.
         if self.use_bspline:
-            # action_input.action_mask is [B, T, D] with the embodiment's padded
-            # dims zeroed out. The per-dim mask is constant across the temporal
-            # axis, so we take one slice and broadcast across K control points.
-            # WITHOUT this mask, the 24/29 padded dims have velocity = 0 − noise
-            # = −noise, so 83% of the loss gradient pushes the model to predict
-            # random noise on padded channels and drowns out the real signal.
-            per_dim_mask = action_input.action_mask[:, :1, :]                 # [B, 1, D]
-            action_mask = per_dim_mask.expand_as(pred_actions).contiguous()   # [B, K, D]
+            # R4: compute loss in trajectory space, not CP space. Decoding
+            # is linear, so MSE(B·pred_cp, B·target_cp) just re-weights the
+            # CP-space MSE by basis structure — directly minimizes the metric
+            # we evaluate (per-step action MAE) instead of an indirect proxy.
+            # Also: action_input.action_mask is [B, T, D] in trajectory space,
+            # which matches the decoded shape — no expand/slice gymnastics.
+            B_ = pred_actions.shape[0]
+            cp_std_view = self.cp_std.view(1, 1, -1)                     # [1, 1, D]
+            # Denormalize velocities back to encoded CP scale before decode,
+            # mirroring inference. Cast to fp32 for the BSpline matmul.
+            pred_cp_real = (pred_actions.float() * cp_std_view)          # [B, K, D] f32
+            target_cp_real = (velocity.float() * cp_std_view)            # [B, K, D] f32
+            # Flatten (B, K, D) → (B, D, K) → (B, D*K) to match BSpline's
+            # native (D, K)-major flat layout.
+            pred_flat = pred_cp_real.transpose(-1, -2).contiguous().reshape(B_, -1)
+            target_flat = target_cp_real.transpose(-1, -2).contiguous().reshape(B_, -1)
+            times_traj = self.t_grid.to(
+                pred_actions.device, dtype=torch.float32
+            ).expand(B_, -1)
+            self.bspline.float()
+            with torch.amp.autocast(device_type=pred_actions.device.type, enabled=False):
+                pred_traj = self.bspline.get_traj_pos(times=times_traj, params=pred_flat)
+                target_traj = self.bspline.get_traj_pos(times=times_traj, params=target_flat)
+            pred_traj = pred_traj.to(pred_actions.dtype)                 # [B, T, D]
+            target_traj = target_traj.to(pred_actions.dtype)             # [B, T, D]
+            action_mask = action_input.action_mask                       # [B, T, D]
+            action_loss = (
+                F.mse_loss(pred_traj, target_traj, reduction="none") * action_mask
+            )
         else:
             action_mask = action_input.action_mask
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+            action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
         return {
