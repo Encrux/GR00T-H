@@ -333,12 +333,14 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         if self.use_bspline:
-            # Original mask is [B, T, D] but our target lives in control-point
-            # space [B, K, D]. Supervise every control point uniformly — the
-            # padded action dims (above the embodiment's true action dim) stay
-            # at zero in the GT trajectory, so they also reconstruct to ~zero
-            # control points and contribute negligibly to the loss.
-            action_mask = torch.ones_like(pred_actions)
+            # action_input.action_mask is [B, T, D] with the embodiment's padded
+            # dims zeroed out. The per-dim mask is constant across the temporal
+            # axis, so we take one slice and broadcast across K control points.
+            # WITHOUT this mask, the 24/29 padded dims have velocity = 0 − noise
+            # = −noise, so 83% of the loss gradient pushes the model to predict
+            # random noise on padded channels and drowns out the real signal.
+            per_dim_mask = action_input.action_mask[:, :1, :]                 # [B, 1, D]
+            action_mask = per_dim_mask.expand_as(pred_actions).contiguous()   # [B, K, D]
         else:
             action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
