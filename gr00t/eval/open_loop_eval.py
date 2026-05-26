@@ -300,6 +300,13 @@ def evaluate_single_trajectory(
         "mse_active_dim": mse_active,
         "mae_active_dim": mae_active,
         "per_key": per_key_metrics,
+        # Raw arrays for downstream trajectory-comparison plotting; consumed
+        # by main() to build the --predictions_npz dump.
+        "_gt_actions": gt_action_across_time,
+        "_pred_actions": pred_action_across_time,
+        "_state_joints": state_joints_across_time,
+        "_action_keys": list(action_keys),
+        "_action_slices": {k: [int(s), int(e)] for k, (s, e) in action_slices.items()},
     }
     return result
 
@@ -343,6 +350,10 @@ class ArgsConfig:
 
     results_json: str | None = None
     """Path to dump per-trajectory results (JSON) for downstream plotting."""
+
+    predictions_npz: str | None = None
+    """If set, dump raw GT + predicted actions per trajectory to this .npz
+    for downstream multi-model trajectory-comparison plots."""
 
     modality_config_path: str | None = None
     """Path to a Python file defining the modality config for the embodiment.
@@ -455,8 +466,39 @@ def main(args: ArgsConfig):
         avg_mse = avg_mae = None
         logging.info("No valid trajectories were evaluated.")
 
+    if args.predictions_npz and per_traj_results:
+        Path(args.predictions_npz).parent.mkdir(parents=True, exist_ok=True)
+        # Trajectories may differ in length when truncated by traj_length, so
+        # store as object arrays.
+        first = per_traj_results[0]
+        np.savez(
+            args.predictions_npz,
+            traj_ids=np.array([r["traj_id"] for r in per_traj_results], dtype=np.int64),
+            task_indices=np.array(
+                [r["task_index"] if r["task_index"] is not None else -1 for r in per_traj_results],
+                dtype=np.int64,
+            ),
+            n_steps=np.array([r["n_steps"] for r in per_traj_results], dtype=np.int64),
+            gt_actions=np.array([r["_gt_actions"] for r in per_traj_results], dtype=object),
+            pred_actions=np.array([r["_pred_actions"] for r in per_traj_results], dtype=object),
+            state_joints=np.array([r["_state_joints"] for r in per_traj_results], dtype=object),
+            action_keys=np.array(first["_action_keys"]),
+            action_slice_keys=np.array(list(first["_action_slices"].keys())),
+            action_slice_bounds=np.array(list(first["_action_slices"].values()), dtype=np.int64),
+            action_horizon=np.int64(args.action_horizon),
+            fps=np.int64(10),
+            model_path=np.array(str(args.model_path) if args.model_path else ""),
+            global_step=np.int64(global_step if global_step is not None else -1),
+        )
+        logging.info(f"Wrote predictions NPZ to {args.predictions_npz}")
+
     if args.results_json:
         import json as _json
+        # Strip the underscore-prefixed raw-array fields from the JSON dump.
+        json_per_traj = [
+            {k: v for k, v in r.items() if not k.startswith("_")}
+            for r in per_traj_results
+        ]
         out = {
             "model_path": args.model_path,
             "global_step": global_step,
@@ -466,7 +508,7 @@ def main(args: ArgsConfig):
             "action_horizon": args.action_horizon,
             "avg_mse": avg_mse,
             "avg_mae": avg_mae,
-            "per_traj": per_traj_results,
+            "per_traj": json_per_traj,
         }
         Path(args.results_json).parent.mkdir(parents=True, exist_ok=True)
         with open(args.results_json, "w") as f:
