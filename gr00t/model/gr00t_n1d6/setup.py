@@ -80,6 +80,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 use_bspline=self.config.model.use_bspline,
                 bspline_num_basis=self.config.model.bspline_num_basis,
                 bspline_degree=self.config.model.bspline_degree,
+                bspline_init_cond_order=self.config.model.bspline_init_cond_order,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,

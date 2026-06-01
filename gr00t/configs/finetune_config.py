@@ -92,6 +92,12 @@ class FinetuneConfig:
     bspline_degree: int = 4
     """B-spline polynomial degree. Degree 4 → C³-continuous → bounded jerk."""
 
+    bspline_init_cond_order: int = 0
+    """B-spline initial-condition order: 0 = free-floating chunk start (default),
+    2 = clamp the chunk start position AND velocity to the current robot state.
+    Order 2 removes inter-chunk discontinuities (the boundary jerk spikes). BEAST
+    only implements orders 0 and 2. Requires state delta_indices=[-1,0]."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""

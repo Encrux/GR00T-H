@@ -109,15 +109,27 @@ class Gr00tN1d6ActionHead(nn.Module):
                 config.beast_processor_id, trust_remote_code=True
             )
             BSplineClass = type(beast_proc.bsp)
+            self.bspline_init_cond_order = getattr(config, "bspline_init_cond_order", 0)
             self.bspline = BSplineClass(
                 num_basis=config.bspline_num_basis,
                 num_dof=config.max_action_dim,
                 degree=config.bspline_degree,
+                init_cond_order=self.bspline_init_cond_order,
             )
-            self.register_buffer(
-                "t_grid",
-                torch.linspace(0, 1, config.action_horizon, dtype=torch.float32),
-            )
+            # Action sample times in spline-phase. With a start clamp
+            # (init_cond_order>0) the boundary control point sits at phase 0
+            # (= the current state); the T action samples must live at phases
+            # (0, 1] so no predicted action is forced onto the clamp. Without a
+            # clamp, the usual [0, 1] grid (action at phase 0) is fine.
+            if self.bspline_init_cond_order > 0:
+                t_grid = torch.linspace(
+                    0, 1, config.action_horizon + 1, dtype=torch.float32
+                )[1:]
+            else:
+                t_grid = torch.linspace(
+                    0, 1, config.action_horizon, dtype=torch.float32
+                )
+            self.register_buffer("t_grid", t_grid)
             # Per-channel std for normalizing control points to ~unit variance
             # before flow matching. Pretrained DiT + action_decoder + the unit-
             # variance noise schedule all assume O(1) targets; unnormalized CPs
@@ -277,6 +289,16 @@ class Gr00tN1d6ActionHead(nn.Module):
                 self.t_grid.to(actions.device, dtype=torch.float32)
                 .expand(B, -1)
             )                                                        # [B, T] f32
+            # Start-clamp (init_cond_order>0): anchor the spline start to the
+            # CURRENT robot state, so consecutive chunks join continuously. We
+            # override the BEAST default (which clamps to the chunk's first
+            # action) because at inference the first action is unknown — only
+            # the current state is. State-normalized ≈ action-normalized for
+            # absolute-action embodiments (sofa_ll: action[t]=state[t+1]).
+            init_pos = None
+            if self.bspline_init_cond_order > 0:
+                init_pos = action_input.state[:, -1, :].to(torch.float32)  # [B, D]
+            bc_kwargs = {"init_pos": init_pos} if init_pos is not None else {}
             # Disable autocast — trainer wraps the whole forward in bf16
             # autocast, which intercepts matmuls/einsums inside the BSpline
             # solve and casts them down to bf16 even though our inputs are
@@ -285,7 +307,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 device_type=actions.device.type, enabled=False
             ):
                 params_dict = self.bspline.learn_mp_params_from_trajs(
-                    times_b, actions.to(torch.float32)
+                    times_b, actions.to(torch.float32), **bc_kwargs
                 )
                 # BSpline returns params flat in (D, K)-major order — each
                 # contiguous block of K values is one DOF's basis. View as
@@ -386,10 +408,15 @@ class Gr00tN1d6ActionHead(nn.Module):
             times_traj = self.t_grid.to(
                 pred_actions.device, dtype=torch.float32
             ).expand(B_, -1)
+            # Start-clamp: pass the SAME init_pos to both decodes. Decoding is
+            # affine, decode(v)=C(init)+L(v); identical init → C cancels in
+            # MSE(C+L(pred), C+L(target)), so the loss is the basis-weighted
+            # comparison exactly as in the no-clamp case (verified numerically).
+            bc_loss = {"init_pos": init_pos} if init_pos is not None else {}
             self.bspline.float()
             with torch.amp.autocast(device_type=pred_actions.device.type, enabled=False):
-                pred_traj = self.bspline.get_traj_pos(times=times_traj, params=pred_flat)
-                target_traj = self.bspline.get_traj_pos(times=times_traj, params=target_flat)
+                pred_traj = self.bspline.get_traj_pos(times=times_traj, params=pred_flat, **bc_loss)
+                target_traj = self.bspline.get_traj_pos(times=times_traj, params=target_flat, **bc_loss)
             pred_traj = pred_traj.to(pred_actions.dtype)                 # [B, T, D]
             target_traj = target_traj.to(pred_actions.dtype)             # [B, T, D]
             action_mask = action_input.action_mask                       # [B, T, D]
@@ -454,6 +481,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         state_features: torch.Tensor,
         embodiment_id: torch.Tensor,
         backbone_output: BatchFeature,
+        raw_state: torch.Tensor = None,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -547,8 +575,15 @@ class Gr00tN1d6ActionHead(nn.Module):
             cp_flat = (
                 actions.transpose(-1, -2).contiguous().reshape(B, -1).to(torch.float32)
             )                                                              # [B, D*K] f32
+            # Start-clamp: anchor the decoded trajectory to the current robot
+            # state (same as training). raw_state is [B, state_horizon, D];
+            # take the current (last) timestep. Falls back to no clamp if not
+            # provided or order 0.
+            bc_infer = {}
+            if self.bspline_init_cond_order > 0 and raw_state is not None:
+                bc_infer = {"init_pos": raw_state[:, -1, :].to(torch.float32)}
             with torch.amp.autocast(device_type=actions.device.type, enabled=False):
-                traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat)
+                traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat, **bc_infer)
             actions = traj.to(dtype=vl_embeds.dtype)                      # [B, T, D]
         return BatchFeature(
             data={
@@ -581,6 +616,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             state_features=features.state_features,
             embodiment_id=action_input.embodiment_id,
             backbone_output=backbone_output,
+            raw_state=getattr(action_input, "state", None),
         )
 
     @property
