@@ -111,7 +111,7 @@ class Gr00tN1d6Config(PretrainedConfig):
     use_bspline: bool = False
     bspline_num_basis: int = 10        # K (control points)
     bspline_degree: int = 4            # C³-continuous → bounded jerk
-    bspline_init_cond_order: int = 0   # 0=free start, 2=clamp start pos+vel to current state
+    bspline_init_cond_order: int = 0   # 0=free start, 1=clamp start pos, 2=clamp start pos+vel (needs 2-step state history)
     beast_processor_id: str = "zhouhongyi/beast"
 
     def __init__(self, **kwargs):

@@ -94,9 +94,18 @@ class FinetuneConfig:
 
     bspline_init_cond_order: int = 0
     """B-spline initial-condition order: 0 = free-floating chunk start (default),
-    2 = clamp the chunk start position AND velocity to the current robot state.
-    Order 2 removes inter-chunk discontinuities (the boundary jerk spikes). BEAST
-    only implements orders 0 and 2. Requires state delta_indices=[-1,0]."""
+    1 = clamp the chunk-start position to the current robot state (removes the
+    position jump at replan boundaries), 2 = clamp position AND velocity
+    (additionally removes the slope kink). Order 2 estimates the start velocity
+    from a 2-step state history and therefore requires the modality config to
+    set state delta_indices=[-1, 0] AND --allow-padding (without padding, the
+    -1 index at episode step 0 silently wraps to the episode's LAST frame)."""
+
+    allow_padding: bool = False
+    """Clamp out-of-range delta indices to the episode's valid range instead of
+    raising / wrapping. Required for negative state delta_indices (e.g. the
+    [-1, 0] history used by bspline_init_cond_order=2): at episode step 0 the
+    -1 index pads to frame 0, giving a zero start-velocity for that one chunk."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None

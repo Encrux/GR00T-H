@@ -110,6 +110,10 @@ class Gr00tN1d6ActionHead(nn.Module):
             )
             BSplineClass = type(beast_proc.bsp)
             self.bspline_init_cond_order = getattr(config, "bspline_init_cond_order", 0)
+            assert self.bspline_init_cond_order in (0, 1, 2), (
+                f"bspline_init_cond_order must be 0 (free), 1 (clamp start pos) or "
+                f"2 (clamp start pos+vel); got {self.bspline_init_cond_order}"
+            )
             self.bspline = BSplineClass(
                 num_basis=config.bspline_num_basis,
                 num_dof=config.max_action_dim,
@@ -201,6 +205,46 @@ class Gr00tN1d6ActionHead(nn.Module):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
         return sample
+
+    def _bspline_boundary_conditions(self, state: torch.Tensor | None) -> dict:
+        """BSpline start-clamp kwargs, shared by training encode, the R4 loss
+        decode and inference decode so train/inference cannot diverge.
+
+        order 1: pin the chunk-start position to the current state s_t.
+        order 2: additionally pin the start velocity, estimated from a 2-step
+        state history (modality config state delta_indices=[-1, 0]).
+
+        Velocity is in spline-phase units: consecutive states are one env step
+        apart, which equals the phase gap t_grid[0] between the clamp (phase 0)
+        and the first action sample — the same dt beast.py's own auto-extract
+        uses. State-normalizer mean offsets cancel in the difference, so the
+        velocity is only sensitive to the (near-identical) std scaling.
+        """
+        order = self.bspline_init_cond_order
+        if order == 0:
+            return {}
+        # Order 1 keeps the shipped behavior bit-for-bit, including the silent
+        # no-clamp fallback when no state is provided at inference.
+        if state is None:
+            assert order < 2, (
+                "bspline_init_cond_order=2 requires the raw state at decode "
+                "time; got None"
+            )
+            return {}
+        bc = {"init_pos": state[:, -1, :].to(torch.float32)}
+        if order >= 2:
+            # Never fall back to beast.py's default init_vel (first diff of the
+            # GT chunk, beast.py learn_mp_params_from_trajs) — that quantity
+            # does not exist at inference and would train a clamp the policy
+            # can't reproduce.
+            assert state.shape[1] >= 2, (
+                "bspline_init_cond_order=2 requires a 2-step state history "
+                "(state delta_indices=[-1, 0]); got state shape "
+                f"{tuple(state.shape)}"
+            )
+            s_prev = state[:, -2, :].to(torch.float32)
+            bc["init_vel"] = (bc["init_pos"] - s_prev) / float(self.t_grid[0])
+        return bc
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -295,10 +339,8 @@ class Gr00tN1d6ActionHead(nn.Module):
             # action) because at inference the first action is unknown — only
             # the current state is. State-normalized ≈ action-normalized for
             # absolute-action embodiments (sofa_ll: action[t]=state[t+1]).
-            init_pos = None
-            if self.bspline_init_cond_order > 0:
-                init_pos = action_input.state[:, -1, :].to(torch.float32)  # [B, D]
-            bc_kwargs = {"init_pos": init_pos} if init_pos is not None else {}
+            # Order 2 additionally clamps the start velocity (2-step history).
+            bc_kwargs = self._bspline_boundary_conditions(action_input.state)
             # Disable autocast — trainer wraps the whole forward in bf16
             # autocast, which intercepts matmuls/einsums inside the BSpline
             # solve and casts them down to bf16 even though our inputs are
@@ -408,11 +450,13 @@ class Gr00tN1d6ActionHead(nn.Module):
             times_traj = self.t_grid.to(
                 pred_actions.device, dtype=torch.float32
             ).expand(B_, -1)
-            # Start-clamp: pass the SAME init_pos to both decodes. Decoding is
-            # affine, decode(v)=C(init)+L(v); identical init → C cancels in
-            # MSE(C+L(pred), C+L(target)), so the loss is the basis-weighted
-            # comparison exactly as in the no-clamp case (verified numerically).
-            bc_loss = {"init_pos": init_pos} if init_pos is not None else {}
+            # Start-clamp: pass the SAME boundary conditions to both decodes.
+            # Decoding is affine, decode(v)=C(init)+L(v); identical init → C
+            # cancels in MSE(C+L(pred), C+L(target)), so the loss is the
+            # basis-weighted comparison exactly as in the no-clamp case
+            # (verified numerically; holds for order 2 as well — both boundary
+            # CPs live in C).
+            bc_loss = bc_kwargs
             self.bspline.float()
             with torch.amp.autocast(device_type=pred_actions.device.type, enabled=False):
                 pred_traj = self.bspline.get_traj_pos(times=times_traj, params=pred_flat, **bc_loss)
@@ -576,12 +620,10 @@ class Gr00tN1d6ActionHead(nn.Module):
                 actions.transpose(-1, -2).contiguous().reshape(B, -1).to(torch.float32)
             )                                                              # [B, D*K] f32
             # Start-clamp: anchor the decoded trajectory to the current robot
-            # state (same as training). raw_state is [B, state_horizon, D];
-            # take the current (last) timestep. Falls back to no clamp if not
-            # provided or order 0.
-            bc_infer = {}
-            if self.bspline_init_cond_order > 0 and raw_state is not None:
-                bc_infer = {"init_pos": raw_state[:, -1, :].to(torch.float32)}
+            # state (same as training). raw_state is [B, state_horizon, D].
+            # Order 1 falls back to no clamp if raw_state is missing (shipped
+            # behavior); order 2 asserts — a malformed spline otherwise.
+            bc_infer = self._bspline_boundary_conditions(raw_state)
             with torch.amp.autocast(device_type=actions.device.type, enabled=False):
                 traj = self.bspline.get_traj_pos(times=times_b, params=cp_flat, **bc_infer)
             actions = traj.to(dtype=vl_embeds.dtype)                      # [B, T, D]

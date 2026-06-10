@@ -193,6 +193,25 @@ if __name__ == "__main__":
     config.model.bspline_num_basis = ft_config.bspline_num_basis
     config.model.bspline_degree = ft_config.bspline_degree
     config.model.bspline_init_cond_order = ft_config.bspline_init_cond_order
+    config.data.allow_padding = ft_config.allow_padding
+    if ft_config.use_bspline and ft_config.bspline_init_cond_order >= 2:
+        # Order 2 derives the start velocity from a 2-step state history.
+        # Without padding, the -1 state delta index at episode step 0 wraps
+        # (iloc) to the episode's LAST frame — silent data corruption.
+        if not ft_config.allow_padding:
+            raise ValueError(
+                "bspline_init_cond_order=2 requires --allow-padding "
+                "(state delta_indices=[-1, 0] would wrap at episode start)"
+            )
+        from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+
+        state_deltas = MODALITY_CONFIGS[embodiment_tag]["state"].delta_indices
+        if len(state_deltas) < 2:
+            raise ValueError(
+                "bspline_init_cond_order=2 requires a 2-step state history, "
+                f"but the '{embodiment_tag}' modality config has state "
+                f"delta_indices={state_deltas} (need [-1, 0])"
+            )
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     if ft_config.extra_augmentation_config:
