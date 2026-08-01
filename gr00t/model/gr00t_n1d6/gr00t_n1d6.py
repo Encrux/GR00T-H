@@ -114,6 +114,26 @@ class Gr00tN1d6ActionHead(nn.Module):
                 f"bspline_init_cond_order must be 0 (free), 1 (clamp start pos) or "
                 f"2 (clamp start pos+vel); got {self.bspline_init_cond_order}"
             )
+            # "state" is only valid when the action IS the (next) state — the
+            # absolute-action embodiments the clamp was built on. RELATIVE
+            # embodiments must use "zero": their chunks are offsets from the
+            # current state, so the chunk-start value is 0 by construction, and
+            # anchoring to the normalized state instead injects a per-chunk
+            # transient correlated with absolute tool position (see the config
+            # field's comment for the measured effect).
+            self.bspline_clamp_anchor = getattr(config, "bspline_clamp_anchor", "state")
+            assert self.bspline_clamp_anchor in ("state", "zero"), (
+                f"bspline_clamp_anchor must be 'state' or 'zero'; "
+                f"got {self.bspline_clamp_anchor!r}"
+            )
+            assert not (
+                self.bspline_clamp_anchor == "zero" and self.bspline_init_cond_order >= 2
+            ), (
+                "bspline_clamp_anchor='zero' supports init_cond_order 1 only: the "
+                "order-2 velocity estimate is finite-differenced in STATE-normalized "
+                "units, which do not match the RELATIVE offset units the spline is "
+                "fit in. Implement the rescaling before combining them."
+            )
             self.bspline = BSplineClass(
                 num_basis=config.bspline_num_basis,
                 num_dof=config.max_action_dim,
@@ -231,6 +251,15 @@ class Gr00tN1d6ActionHead(nn.Module):
                 "time; got None"
             )
             return {}
+        if self.bspline_clamp_anchor == "zero":
+            # RELATIVE embodiments: the spline is fit to offsets-from-current-
+            # state, whose chunk-start value is 0 by construction. The state
+            # tensor supplies only shape/device/batch. (The exact normalized
+            # zero is (0 − μ[t→0])/σ[t→0] under per-timestep stats; μ[1] is the
+            # dataset-mean one-step displacement ≈ 0, and any residual is a
+            # CONSTANT — identical at train and decode, absorbed by the model —
+            # unlike the state anchor, which varies with tool position.)
+            return {"init_pos": torch.zeros_like(state[:, -1, :], dtype=torch.float32)}
         bc = {"init_pos": state[:, -1, :].to(torch.float32)}
         if order >= 2:
             # Never fall back to beast.py's default init_vel (first diff of the

@@ -112,6 +112,18 @@ class Gr00tN1d6Config(PretrainedConfig):
     bspline_num_basis: int = 10        # K (control points)
     bspline_degree: int = 4            # C³-continuous → bounded jerk
     bspline_init_cond_order: int = 0   # 0=free start, 1=clamp start pos, 2=clamp start pos+vel (needs 2-step state history)
+    # What the start clamp anchors to. "state" (default, shipped behavior): the
+    # current normalized state — correct ONLY for absolute-action embodiments,
+    # where action[t]=state[t+1] and the state/action normalizers coincide
+    # (sofa_ll). "zero": the zero vector — the chunk-start value of a RELATIVE
+    # action chunk, which is offsets-from-current-state, ≈0 at the chunk start
+    # by construction in the per-timestep-normalized offset space the spline is
+    # fit in. Anchoring a RELATIVE spline to the normalized STATE pins it to an
+    # absolute-position-correlated value in a space where absolute position does
+    # not exist, injecting a per-chunk start transient into both the training
+    # targets and the decoded trajectory (measured on BTM-Z: K5+ic1 executed
+    # jerk δ +0.49/+0.41 vs the unclamped baseline, the reverse of sofa_ll).
+    bspline_clamp_anchor: str = "state"  # "state" (absolute embodiments) | "zero" (relative)
     beast_processor_id: str = "zhouhongyi/beast"
 
     def __init__(self, **kwargs):
