@@ -114,25 +114,19 @@ class Gr00tN1d6ActionHead(nn.Module):
                 f"bspline_init_cond_order must be 0 (free), 1 (clamp start pos) or "
                 f"2 (clamp start pos+vel); got {self.bspline_init_cond_order}"
             )
-            # "state" is only valid when the action IS the (next) state — the
-            # absolute-action embodiments the clamp was built on. RELATIVE
-            # embodiments must use "zero": their chunks are offsets from the
-            # current state, so the chunk-start value is 0 by construction, and
-            # anchoring to the normalized state instead injects a per-chunk
-            # transient correlated with absolute tool position (see the config
-            # field's comment for the measured effect).
+            # The state anchor is only valid when the action IS the (next)
+            # state — the absolute-action embodiments the clamp was built on.
+            # RELATIVE embodiments cannot use the clamp at all (no constant
+            # anchor exists in per-timestep-normalized offset space; see
+            # _bspline_boundary_conditions) — they use init_cond_order=0.
             self.bspline_clamp_anchor = getattr(config, "bspline_clamp_anchor", "state")
-            assert self.bspline_clamp_anchor in ("state", "zero"), (
-                f"bspline_clamp_anchor must be 'state' or 'zero'; "
-                f"got {self.bspline_clamp_anchor!r}"
-            )
-            assert not (
-                self.bspline_clamp_anchor == "zero" and self.bspline_init_cond_order >= 2
-            ), (
-                "bspline_clamp_anchor='zero' supports init_cond_order 1 only: the "
-                "order-2 velocity estimate is finite-differenced in STATE-normalized "
-                "units, which do not match the RELATIVE offset units the spline is "
-                "fit in. Implement the rescaling before combining them."
+            assert self.bspline_clamp_anchor == "state", (
+                f"bspline_clamp_anchor={self.bspline_clamp_anchor!r}: 'zero' is "
+                "retired as unsound (per-timestep RELATIVE stats make every "
+                "normalized sample O(1), so no constant anchor is correct — see "
+                "_bspline_boundary_conditions). RELATIVE embodiments: use "
+                "init_cond_order=0. The state anchor remains correct for "
+                "absolute-action embodiments only."
             )
             self.bspline = BSplineClass(
                 num_basis=config.bspline_num_basis,
@@ -252,14 +246,27 @@ class Gr00tN1d6ActionHead(nn.Module):
             )
             return {}
         if self.bspline_clamp_anchor == "zero":
-            # RELATIVE embodiments: the spline is fit to offsets-from-current-
-            # state, whose chunk-start value is 0 by construction. The state
-            # tensor supplies only shape/device/batch. (The exact normalized
-            # zero is (0 − μ[t→0])/σ[t→0] under per-timestep stats; μ[1] is the
-            # dataset-mean one-step displacement ≈ 0, and any residual is a
-            # CONSTANT — identical at train and decode, absorbed by the model —
-            # unlike the state anchor, which varies with tool position.)
-            return {"init_pos": torch.zeros_like(state[:, -1, :], dtype=torch.float32)}
+            # UNSOUND — kept only so old configs fail loudly instead of
+            # silently. The justification this shipped with ("offsets are ≈0 at
+            # the chunk start, residual is a constant") ignored that RELATIVE
+            # stats are PER-TIMESTEP (stats.py: "temporal-aware, shape
+            # (horizon, dim)"): each sample is divided by its own σ[t], and
+            # σ[1] — the std of one-step displacements — is physically tiny, so
+            # the normalized trajectory is unit-variance from the FIRST sample.
+            # It does not start near zero; a zero anchor at phase 0 against an
+            # O(1), per-episode-varying sample at phase 1/8 injects a new
+            # transient of the same class as the state anchor's. Under
+            # per-timestep-normalized
+            # RELATIVE no constant anchor is correct — the clamp would have to
+            # be applied in physical space before normalization. Until that
+            # exists, RELATIVE embodiments must use init_cond_order=0; the LL
+            # object-side result shows the clamp's benefit does not reach the
+            # manipulated object anyway (loop jerk K5 2.368 vs K5+ic1 2.416).
+            raise ValueError(
+                "bspline_clamp_anchor='zero' is unsound under per-timestep-"
+                "normalized RELATIVE actions and has been retired; use "
+                "init_cond_order=0 for RELATIVE embodiments (see comment)."
+            )
         bc = {"init_pos": state[:, -1, :].to(torch.float32)}
         if order >= 2:
             # Never fall back to beast.py's default init_vel (first diff of the
